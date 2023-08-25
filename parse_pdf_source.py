@@ -294,7 +294,7 @@ class PdfInterpreter():
                             else:
                                 break
             except StopIteration:
-                print(f'EOF exception') 
+                print('EOF exception') 
                 self.EOF = True
                 b = None           
         return b                    # returning raw byte b instead of bytes([b]) or bytes(bs) 
@@ -327,7 +327,7 @@ class PdfInterpreter():
                 except Exception as e:
                     print(f'EOF exception {e}') 
                     self.EOF = True
-                    breaksd
+                    break
         return bs
         
     

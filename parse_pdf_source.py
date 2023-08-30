@@ -38,10 +38,10 @@ def readBytes(file, chunk=16384):
 
 class PdfInterpreter():
     # char classes.
-    CHAR_WS = [0,9,10,12,13,32]                           + [b'\x00',b'\t',b'\n',b'\x0c',b'\r',b' ']                     
-    CHAR_EOL = [10,13]                                    + [b'\n',b'\r']
-    CHAR_DELIM = [40,41,60,62,91,93,123,125,47,37]        + [b'(',b')',b'<',b'>',b'[',b']',b'{',b'}',b'/',b'%']                           
-    CHAR_NUM = [48,49,50,51,52,53,54,55,56,57,43,45,46]   + [b'0',b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9',b'+',b'-',b'.']  
+    CHAR_WS = [0,9,10,12,13,32]                          # + [b'\x00',b'\t',b'\n',b'\x0c',b'\r',b' ']                     
+    CHAR_EOL = [10,13]                                   # + [b'\n',b'\r']
+    CHAR_DELIM = [40,41,60,62,91,93,123,125,47,37]       # + [b'(',b')',b'<',b'>',b'[',b']',b'{',b'}',b'/',b'%']                           
+    CHAR_NUM = [48,49,50,51,52,53,54,55,56,57,43,45,46]  # + [b'0',b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9',b'+',b'-',b'.']  
     CHAR_NONREG = CHAR_WS + CHAR_DELIM 
     KEYWORDS = ['obj','endobj',b'stream',b'endstream','R','true','false','xref','f','n','trailer','startxref']
     
@@ -93,7 +93,7 @@ class PdfInterpreter():
     # @profile
     def nextToken(self):
         # parse non-recurive PDF syntax tokens (ie. will make a token for a comment, but the parser will have to handle nested dictionaries etc)
-        # also will not handle 'look back' tokens. ie to make an object token we have to see 'obj' or 'R' and then pop the last two int tokens to make object token.
+        # BUT will not handle 'look back' tokens. ie to make an object token we have to see 'obj' or 'R' and then pop the last two int tokens to make object token.
         # backtracking behavior would not make sense in the context of nextToken as a generator, since we'd see int,ws,int,ws,OBJ=[int,int,'obj|'r'],
             # and it would not be efficient to look forward every time we see an int. we'll make the object in the parser
         
@@ -303,7 +303,7 @@ class PdfInterpreter():
     def nextBytes(self,n):  # seperating nextBye(n=1) and nextByte(n=8) gives 10% speed boost 
         bs=[]
         for _ in range(n):          # this loop works for case n=1 also. 
-            if self.peek>0:         # but there is overhead in creating a 1-iteration loop.
+            if self.peek>0:         # but there is overhead in creating a 1-iteration loop, so we create two nearly identical functions nextByte->Int and nextBytes->List[Int]
                 bs.append(self.bytes[-1*self.peek])
                 self.peek -= 1
             else:  
@@ -419,6 +419,17 @@ print(f'read {interp.pos+1} bytes in {end-start:0.1f}s, {(interp.pos+1)/(1024*10
         # ie. dont check for EOF on every byte, just write it smarter so we dont have to
     
 
-        # BEST SPEED SO FAR 5.67MB/s
+        # BEST SPEED SO FAR 5.89MB/s
+        
+        
+# OK BACK TO IT
+    # make sure it can parse PDF spec docuent (linearized)
+    # parse token stream
+        # build object dictionary {id: {name1: {}, name2:{},...}, id2: ...}
+        # build xref table/lookup dict
+        # build bookmark list
+    # generate PDF binary file from object structure.
+        # make sure to generate proper byte offsets
+    # once it can do this, remove erwin water marks and go back to wifi script
             
         

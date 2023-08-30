@@ -107,6 +107,7 @@ class PdfInterpreter():
         
         pos=self.pos-self.peek       # start position (byte offset) of this token
         token_type = 'NONE'
+        data=None
         
         if b in self.CHAR_WS:  # consume all whitespace chars including spaces and newline as one (7.2.3)
             token_type = 'CHAR_EOL' if b in self.CHAR_EOL else 'CHAR_WS'
@@ -115,7 +116,7 @@ class PdfInterpreter():
                 continue
             self.peek += 1
             self.flushStack()
-            data = None
+            # data = None
        
         elif b in self.CHAR_NUM:
             token_type = 'NUM_INT'
@@ -166,10 +167,10 @@ class PdfInterpreter():
                 if self.nextByte()==60:  # b'<':         # dict_begin '<<' token
                     token_type = 'DICT_BEGIN'
                     self.popByte()
-                    data = None
+                    # data = None
                 else:
                     token_type = 'STR_HEX'
-                    while not self.nextByte()!=62:  # b'>': 
+                    while not self.nextByte()==62:  # b'>': 
                         continue
                     self.popByte()
                     data = bytes(self.flushStack())
@@ -179,7 +180,7 @@ class PdfInterpreter():
                 if self.nextByte()==62:  # b'>':
                     token_type = 'DICT_END'
                     self.popByte()
-                    data = None
+                    # data = None
                 else:
                     self.peek += 1
                     print(f'error at pos {pos}: single > when >> expected')
@@ -188,20 +189,20 @@ class PdfInterpreter():
             elif b==91:  # b'[':
                 self.popByte()
                 token_type = 'ARR_BEGIN'
-                data=None
+                # data=None
             elif b==93:  # b']':
                 self.popByte()
                 token_type = 'ARR_END'
-                data=None
+                # data=None
                 
             elif b==123:  # b'{':
                 self.popByte()
                 token_type = 'FN_BEGIN'
-                data=None
+                # data=None
             elif b==125:  # b'}':
                 self.popByte()
                 token_type = 'FN_END'
-                data = None  
+                # data = None  
                         
             else:
                 print(f'unhandled delim {b}')
@@ -216,16 +217,16 @@ class PdfInterpreter():
             
             if keyword == b'R':
                 token_type = 'OBJ_REF'
-                data=None
+                # data = None
             elif keyword == b'n':
                 token_type = 'XREF_INUSE'
-                data = None
+                # data = None
             elif keyword == b'obj':
                 token_type = 'OBJ_BEGIN'
-                data = None
+                # data = None
             elif keyword == b'endobj':
                 token_type = 'OBJ_END'
-                data=None
+                # data=None
             elif keyword == b'stream':
                 token_type = 'STREAM'
                 stream=True
@@ -244,7 +245,7 @@ class PdfInterpreter():
                                 self.peek += 8
             elif keyword == b'null':
                 token_type = 'NULL'
-                data = None
+                # data = None
             elif keyword == b'false':
                 token_type = 'BOOL'
                 data = False
@@ -253,17 +254,17 @@ class PdfInterpreter():
                 data = True
             elif keyword == b'xref':
                 token_type = 'XREF_BEGIN'
-                data = None
+                # data = None
                 self.xrefLoc = pos
             elif keyword == b'f':
                 token_type = 'XREF_FREE'
-                data = None
+                # data = None
             elif keyword == b'trailer':
                 token_type = 'TRAILER'
-                data = None
+                # data = None
             elif keyword == b'startxref':
                 token_type = 'XREF_LOC'
-                data = None    
+                # data = None    
             else:
                 print(f'unhandled keyword {keyword}')
                 token_type = 'REG'  # should never get here.
@@ -334,7 +335,7 @@ class PdfInterpreter():
 ##############################################################
 
 
-file = 'engine_pyCopy.pdf'
+file = 'ISO_32000-2-2020_sponsored.pdf'
 
 
 interp = PdfInterpreter(file)
@@ -423,7 +424,7 @@ print(f'read {interp.pos+1} bytes in {end-start:0.1f}s, {(interp.pos+1)/(1024*10
         
         
 # OK BACK TO IT
-    # make sure it can parse PDF spec docuent (linearized)
+    # make sure it can parse PDF spec docuent (linearized) OK
     # parse token stream
         # build object dictionary {id: {name1: {}, name2:{},...}, id2: ...}
         # build xref table/lookup dict

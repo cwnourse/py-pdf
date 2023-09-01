@@ -13,18 +13,18 @@ import time
 
 # Token = namedtuple('Token', ['type','value','pos'])
 class Token:
-    def __init__(self,token_type,value,pos):
+    def __init__(self,token_type,data,pos):
         self.type = token_type
-        self.value = value
+        self.data = data
         self.pos = pos
     def __repr__(self):
-        return f'Token<{self.type}><{self.value}><{self.pos}>'
+        return f'Token<{self.type}><{self.data}><{self.pos}>'
     def __str__(self):
         return f'Token<{self.type}>'
     def __eq__(self, o):
         return self.type == o.type
     def __contains__(self,o):
-        return self.value.__contains__(o)
+        return self.data.__contains__(o)
     
         
 def readBytes(file, chunk=16384):
@@ -46,10 +46,11 @@ class PdfInterpreter():
     KEYWORDS = ['obj','endobj',b'stream',b'endstream','R','true','false','xref','f','n','trailer','startxref']
     
     def __init__(self,filename):
-        self.data = readBytes(filename)
-        self.reader = iter(self.data)
+        self.data = readBytes(filename)          # reading whole file and iterating gets ~0.5MB/s faster than lazy iterator (yield from fchunk)
+        self.reader = iter(self.data)            # but presumably worse memory performance.
         # self.reader = readBytes(filename)
         
+        self.objects = {}  # object dictionary: {(objNum, genNum): [Dict,Stream], ...}
         self.tokens = []   # stack of tokens
         self.bytes = []   # stack of read bytes
         self.pos = -1      # current byte offset into file such that file[pos]=bytes[-1]. 0=first byte
@@ -70,7 +71,8 @@ class PdfInterpreter():
 
     # @profile
     def popByte(self,n=1):
-        # remove and return last tokens added to stack self.byte, oldest first order
+        # remove and return last tokens added to stack self.byte, oldest first order if n>1.
+        # return [self.bytes.pop() for _ in range(n)][::-1]  # equivalent and more pythonic, but slower.
         pop,self.bytes = self.bytes[-1*n:],self.bytes[:-1*n]
         self.peek -= n if self.peek else 0               # make sure to decrement peek if present
         if self.peek<0: self.peek=0
@@ -85,8 +87,8 @@ class PdfInterpreter():
             while self.nextToken(): continue
         return None
         
-    def newToken(self,token_type,value,position) -> Token:
-        t = Token(token_type,value,position)
+    def newToken(self,token_type,data,position) -> Token:
+        t = Token(token_type,data,position)
         self.tokens.append(t)
         return t
     
@@ -117,7 +119,8 @@ class PdfInterpreter():
             self.peek += 1
             self.flushStack()
             # data = None
-       
+            return self.nextToken()  # whitespace and newline serve no semantic purpose, so skip these tokens. We can insert them when rebuilding the document according to rules.
+            
         elif b in self.CHAR_NUM:
             token_type = 'NUM_INT'
             while (p:=self.nextByte()) in self.CHAR_NUM:
@@ -138,7 +141,7 @@ class PdfInterpreter():
                 token_type = 'COMMENT'
                 while self.nextByte() not in self.CHAR_EOL: continue
                 self.peek += 1
-                data = bytes(self.flushStack())   # save comment text, because %PDF-1.x, %bbbb, and %%EOF will tokenize as comments and we should check for them
+                data = bytes(self.flushStack())   # save comment text, because %PDF-1.x, %bbbb, and %%EOF will tokenize as comments and we should check for them in the builder
             
             elif b==40:  # b'(':
                 token_type = 'STR_LIT'
@@ -205,9 +208,9 @@ class PdfInterpreter():
                 # data = None  
                         
             else:
-                print(f'unhandled delim {b}')
+                print(f'unhandled delim {b} at line {self.line}, byte {pos}')
                 token_type = 'DELIM'
-                data = self.flushStack()
+                data = self.flushStack() 
      
         else: # not whitespace, numeric, or delim. scan for regular chars
             while self.nextByte() not in self.CHAR_NONREG: continue
@@ -217,13 +220,21 @@ class PdfInterpreter():
             
             if keyword == b'R':
                 token_type = 'OBJ_REF'
-                # data = None
+                # last two tokens are ints, if we ignore whitespace.. can get the last two tokens for object/generation numbers
+                # objnum = self.tokens[-2]
+                # gennum = self.tokens[-1]
+                # data = (objnum.data, gennum.data)
+                # pos = objnum.pos              
             elif keyword == b'n':
                 token_type = 'XREF_INUSE'
                 # data = None
             elif keyword == b'obj':
                 token_type = 'OBJ_BEGIN'
-                # data = None
+                # last two tokens are ints, if we ignore whitespace.. can get the last two tokens for object/generation numbers
+                # objnum = self.tokens[-2]
+                # gennum = self.tokens[-1]
+                # data = (objnum.data, gennum.data)
+                # pos = objnum.pos
             elif keyword == b'endobj':
                 token_type = 'OBJ_END'
                 # data=None
@@ -255,7 +266,7 @@ class PdfInterpreter():
             elif keyword == b'xref':
                 token_type = 'XREF_BEGIN'
                 # data = None
-                self.xrefLoc = pos
+                # self.xrefLoc = pos
             elif keyword == b'f':
                 token_type = 'XREF_FREE'
                 # data = None
@@ -268,7 +279,8 @@ class PdfInterpreter():
             else:
                 print(f'unhandled keyword {keyword}')
                 token_type = 'REG'  # should never get here.
-        return self.newToken(token_type, data, pos)
+        return self.newToken(token_type, data, pos)               # appends token to class token list self.tokens. useful for debugging, not nedd for function
+        # return Token(token_type,data,pos)                       # returns token, does NOT save to list
     
     # @profile    
     def nextByte(self):       # peek bool allows us to read the next byte without inc counters etc..         
@@ -300,7 +312,7 @@ class PdfInterpreter():
                 b = None           
         return b                    # returning raw byte b instead of bytes([b]) or bytes(bs) 
                                     # and converting to bytes where needed gives >4MB/s!!
-           
+    # @profile      
     def nextBytes(self,n):  # seperating nextBye(n=1) and nextByte(n=8) gives 10% speed boost 
         bs=[]
         for _ in range(n):          # this loop works for case n=1 also. 
@@ -330,27 +342,81 @@ class PdfInterpreter():
                     self.EOF = True
                     break
         return bs
+    
+    def newObject(self,objnum,gennum,data):
+        key = (objnum,gennum)
+        self.objects[key] = data
+        return key
+    
+    def nextObject(self,stack=[]):
+        if self.EOF:
+            return False
+        token = self.nextToken()
+        if token.type in ['NUM_REAL','NUM_INT','STR_LIT','STR_HEX','BOOL','NAME','STREAM','NULL']:
+            stack.append(token.data)
+            return self.nextObject(stack)
+        elif token.type in ['DICT_BEGIN','ARR_BEGIN']:
+            stack.append(self.nextObject([]))
+            return self.nextObject(stack)
+        elif token.type == 'OBJ_REF':
+            gennum,objnum = stack.pop(),stack.pop()
+            stack.append({(objnum,gennum): 'REF'})
+            return self.nextObject(stack)
+        elif token.type == 'OBJ_BEGIN':
+            gennum,objnum = stack.pop(),stack.pop()
+            objdata = self.nextObject([])
+            return self.newObject(objnum,gennum,objdata)   # TOP LEVEL BASE CASE
+        elif token.type == 'DICT_END':
+            return dict(zip(stack[::2],stack[1::2]))  # make key/value pairs of stack objects
+        elif token.type in ['ARR_END','OBJ_END']:
+            return stack
+        elif token.type == 'COMMENT':
+            return self.nextObject(stack)
+        elif token.type == 'XREF_BEGIN':  #'xref' keyword, start of xref table
+            # build xref table here
+            return False
+        elif token.type == 'XREF_LOC':  # 'startxref' kw, next token is byte offset of xref location
+            # get next int token here
+            return False
+        elif token.type == 'TRAILER':
+            # build trailer here. its just a dictionary, so safe to call nextObj here          
+            return False
+        else:
+            print(f'unhandled token {token}')
+            print(f'{stack=}')
+            return False
+            
+
         
     
 ##############################################################
 
 
-file = 'ISO_32000-2-2020_sponsored.pdf'
+# file = 'ISO_32000-2-2020_sponsored.pdf'
+file = 'engine_pyCopy.pdf'
 
 
 interp = PdfInterpreter(file)
 
-
-start=time.time()
 i=0
-while interp.nextToken():
+start=time.time()
+while interp.nextObject():
     i+=1
-    if not i%50000:
-        print(f'{time.time()-start:0.1f}s, pos={interp.pos}')
     pass
-# interp.tokenize()
 end=time.time()
-print(f'read {interp.pos+1} bytes in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
+print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
+
+
+# start=time.time()
+# i=0
+# while interp.nextToken():
+#     # i+=1
+#     # if not i%50000:
+#     #     print(f'{time.time()-start:0.1f}s, pos={interp.pos}')
+#     pass
+# # interp.tokenize()
+# end=time.time()
+# print(f'read {interp.pos+1} bytes in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
 
  
 
@@ -358,44 +424,21 @@ print(f'read {interp.pos+1} bytes in {end-start:0.1f}s, {(interp.pos+1)/(1024*10
 # TODO
 # OK handle '<<' and '>>' delimiters OK
 # OK handle hex string OK
-# token parser:
-    # convert <int> <int> <obj|R> to object token  (in parser)
+# OK token parser:
+    # OK convert <int> <int> <obj|R> to object token  (in parser)
         # handle 'endobj'
-    # build nested arrays and dicts
+    # OK build nested arrays and dicts
+    # Build xref, trailer!
 # once parsed, write back to PDF file. successful if we can open as normal!
 # gui for displaying hierarchy of doc objects
     # check boxes to include/exclude, then recompile PDF
-# syntax error handling according to spec
+# NO syntax error handling according to spec
 # OK figure out whats so inefficient in this code!! it takes for fricken ever.
     # change from string appends to array appends sped up code like 1million times, now we are at 1.2mb/s from 0.04mb/s
     # beggest ineefficiency is the constant peeking, which is more expensive than reading. retool algorithm to avoid peaking
 # OK handle ']' delim. doesnt work if name is last element etc [... /Name] makes a single name taken value='Name]' instead of two tokens 'Name' and ']'
 
-# convert obj,endobj keywords  OBJ_BEGIN OBJ_END tokens
-
-    
-# TOKEN LIST:
-    # regular:
-        # NUM_INT
-        # NUM_REAL
-        # STR_LIT
-        # STR_HEX
-        # STREAM
-    # delimiters:        
-        # ARR_BEGIN
-        # ARR_END
-        # DICT_BEGIN
-        # DICT_END
-    # whitespace:
-        # WS
-        # WS_EOL
-
-# OK we are bogged down. must move forward with parsing
-    # validate lexer before parsing:
-            # create 'unit test' file of edge cases to tokenize
-                # make sure all tokens/delims are successfully detected
-                
-                
+         
 # according to lineprofiler there don't appear to be any more bottle necks
 # we are running at 2.63MB/s for tokenizing PDF data. this may be the fastest we can go
 # over 90% of time taken by byte read operation so improvements here could help
@@ -419,8 +462,7 @@ print(f'read {interp.pos+1} bytes in {end-start:0.1f}s, {(interp.pos+1)/(1024*10
     # minimize compares
         # ie. dont check for EOF on every byte, just write it smarter so we dont have to
     
-
-        # BEST SPEED SO FAR 5.89MB/s
+        # BEST SPEED SO FAR 6.46MB/s with parsing all objects :)
         
         
 # OK BACK TO IT
@@ -432,5 +474,5 @@ print(f'read {interp.pos+1} bytes in {end-start:0.1f}s, {(interp.pos+1)/(1024*10
     # generate PDF binary file from object structure.
         # make sure to generate proper byte offsets
     # once it can do this, remove erwin water marks and go back to wifi script
-            
+
         

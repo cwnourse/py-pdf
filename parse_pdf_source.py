@@ -9,6 +9,7 @@ parser implemented based on ISO 32000-2:2020(E) (PDF2.0)
 @author: noursec
 """
 import time
+import zlib
 # from collections import namedtuple
 
 # Token = namedtuple('Token', ['type','value','pos'])
@@ -36,28 +37,123 @@ def readBytes(file, chunk=16384):
         # while fchunk := f.read(chunk):
         #     yield from fchunk
 
+class ByteReader():
+    def __init__(self, filename, chunkSize=4096):
+        self.filename = filename
+        self.f = open(self.filename,'rb')
+        self.size = self.f.seek(0,2)
+        self.pos = self.f.seek(0)     # = 0
+        self.chunkSize = chunkSize
+        self.chunk = b''       
+        self.chunkLength = -1  # length of chunk. should be same as chunk size except for last chunk
+        self.chunkBegin = -1  # byte offset of first byte in chunk.
+        self.lastChunk = False  # flag that there are no more bytes to read in file
+    def __del__(self):
+        self.f.close()
+        
+    ########################################
+    # custom iterator methods
+    ########################################
+    
+    def __iter__(self):
+        return self
+    def __next__(self):
+        try:
+            b = self.chunk[self.pos-self.chunkBegin]
+            self.pos += 1
+            return b
+        except(IndexError):  # if bounds of chunk are exceeded or chunk is not loaded
+            self.__loadChunk()  # will raise StopIteration if no more chunks to load
+            return next(self)  
+    def __loadChunk(self):
+        self.chunk = self.f.read(self.chunkSize)      
+        self.chunkBegin = self.pos
+        # self.chunkLength = len(self.chunk)
+        if not self.chunk:
+            raise StopIteration
+    def seek(self,pos):
+        # this method should alter behavior of next method to return byte from file pointer position
+        if pos > self.size:
+            return False
+        self.f.seek(pos)
+        self.pos = pos
+        self.chunk = self.f.read(self.chunkSize)
+        self.chunkBegin = pos
+        return True
+    
+    ###########################################
+    # Generators 
+    ###########################################
+   
+    def readAll(self,pos=0):  
+        # highest-performance iterator over file, but most expensive memorywise
+        with open(self.filename,'rb') as f:
+            f.seek(pos)
+            self.data = f.read()
+            return iter(self.data)  # faster than yield from self.data
+    def readChunks(self,chunkSize=2048,pos=0):
+        # higher performance than custom iterator, but worse than readAll
+        with open(self.filename,'rb') as f:
+            f.seek(pos)
+            while chunk:=f.read(chunkSize):
+                yield from chunk
+    def readReverse(self):
+        # very slow, but not super critical... only used once
+        with open(self.filename,'rb') as f:
+            f.seek(-1,2)
+            while f.tell()!=0:       
+                b = f.read(1)    # reverse byte iteration not used much, so its ok to do the slow simple method here vs. yielding from chunks
+                f.seek(-2,1)
+                yield ord(b)
+    
+
 class PdfInterpreter():
     # char classes.
     CHAR_WS = [0,9,10,12,13,32]                          # + [b'\x00',b'\t',b'\n',b'\x0c',b'\r',b' ']                     
     CHAR_EOL = [10,13]                                   # + [b'\n',b'\r']
     CHAR_DELIM = [40,41,60,62,91,93,123,125,47,37]       # + [b'(',b')',b'<',b'>',b'[',b']',b'{',b'}',b'/',b'%']                           
-    CHAR_NUM = [48,49,50,51,52,53,54,55,56,57,43,45,46]  # + [b'0',b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9',b'+',b'-',b'.']  
+    CHAR_INT = [48,49,50,51,52,53,54,55,56,57]           # + [b'0',b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9']
+    CHAR_NUM = CHAR_INT + [43,45,46]                     # + [b'+',b'-',b'.']  
     CHAR_NONREG = CHAR_WS + CHAR_DELIM 
     KEYWORDS = ['obj','endobj',b'stream',b'endstream','R','true','false','xref','f','n','trailer','startxref']
     
     def __init__(self,filename):
-        self.data = readBytes(filename)          # reading whole file and iterating gets ~0.5MB/s faster than lazy iterator (yield from fchunk)
-        self.reader = iter(self.data)            # but presumably worse memory performance.
-        # self.reader = readBytes(filename)
-        
+        self.filename = filename
+        # self.reader = iter(readBytes(filename))       # 5.44MB/s
+        # self.reader = ByteReader(filename)            # 3.90MB/s
+        # self.reader = ByteReader(filename).readAll()  # 5.46MB/s
+        self.reader = ByteReader(filename).readChunks() # 5.05MB/s
         self.objects = {}  # object dictionary: {(objNum, genNum): [Dict,Stream], ...}
         self.tokens = []   # stack of tokens
         self.bytes = []   # stack of read bytes
         self.pos = -1      # current byte offset into file such that file[pos]=bytes[-1]. 0=first byte
         self.line = 1      # current line number, delim by /n, /r, or /r/n
         self.peek = 0      # current 'look ahead' in file. nextByte returns from byte stack
-        self.xrefLoc = None
+        self.xrefLocation = None
         self.EOF = False
+        
+    def seek(self,offset):
+        # updates the file reader so that next(self.reader) bgeins at specified offset
+        # self.reader.seek(offset)  # if self.reader=ByteReader()
+        self.reader = ByteReader(self.filename).readChunks(pos=offset)
+        self.pos = offset
+        
+    def getXrefLocation(self):
+        # returns the byte offset of the main xref table for this document
+            # seek to this position and get next object to get xref table.
+        # file always ends with '...startxref\n{INT}\n%%EOF\n'. read backwards to get this int
+        lastByte = ByteReader(self.filename).readReverse()     # generator yields bytes from end
+        while (b:=next(lastByte)) not in self.CHAR_INT: continue
+        xrefloc = [b]
+        while (b:=next(lastByte)) in self.CHAR_INT:
+            xrefloc.append(b)
+        # del lastByte
+        self.xrefLocation = int(bytes(xrefloc[::-1]))
+        return self.xrefLocation
+        
+    #################################################
+    # internal data structure methods
+    #################################################
         
     def flushStack(self):
         # flushes stack, returns buffered bytes. 
@@ -70,18 +166,37 @@ class PdfInterpreter():
         self.tokens.append(token)
 
     # @profile
-    def popByte(self,n=1):
+    def popByte(self,n=1): 
         # remove and return last tokens added to stack self.byte, oldest first order if n>1.
         # return [self.bytes.pop() for _ in range(n)][::-1]  # equivalent and more pythonic, but slower.
         pop,self.bytes = self.bytes[-1*n:],self.bytes[:-1*n]
         self.peek -= n if self.peek else 0               # make sure to decrement peek if present
         if self.peek<0: self.peek=0
         return pop  # raw int value of byte
-    
-      
+        # return self.bytes.pop()
+        
+    ################################################
+    # data processing methods
+    ###############################################
+    def deflate(self,data):
+        return zlib.decompress(data)
+    def unpredict(self,data,columns):
+        out = []
+        j=0
+        for i,b in enumerate(data):
+            if not i%(columns+1): # each row introduced with a byte dictating the method of predition used for this row. 0=none,2=up
+                method = b
+            elif method==2:  # 'up' method
+                up = out[j-columns] if j>columns-1 else 0
+                out.append((b+up)%256)
+                j+=1
+            else:
+                print(f'predition method {method} not implemented')
+                return None
+        return out
     ##############################################
-    # tokenizer, call nextToken() while true to generate all tokens. perhaps make this a generator
-    
+    # tokenizer
+    ###############################################
     def tokenize(self):
         if not self.EOF:
             while self.nextToken(): continue
@@ -119,7 +234,7 @@ class PdfInterpreter():
             self.peek += 1
             self.flushStack()
             # data = None
-            return self.nextToken()  # whitespace and newline serve no semantic purpose, so skip these tokens. We can insert them when rebuilding the document according to rules.
+            return self.nextToken()  # don't create whitespace token. whitespace and newline serve no semantic purpose, we can insert them when rebuilding the document according to rules.
             
         elif b in self.CHAR_NUM:
             token_type = 'NUM_INT'
@@ -139,19 +254,19 @@ class PdfInterpreter():
             if b==37:  # b'%':                           
                 self.popByte()
                 token_type = 'COMMENT'
-                while self.nextByte() not in self.CHAR_EOL: continue
+                while self.nextByte() not in self.CHAR_EOL: continue  # read comment until end-of-line
                 self.peek += 1
-                data = bytes(self.flushStack())   # save comment text, because %PDF-1.x, %bbbb, and %%EOF will tokenize as comments and we should check for them in the builder
+                data = bytes(self.flushStack())   # save comment text, because %PDF-1.x, %bbbb, and %%EOF will tokenize as comments and we should check for them in the builder. otherwise comment text could be ignored
             
             elif b==40:  # b'(':
                 token_type = 'STR_LIT'
                 self.popByte()                 # pop '(' delim
                 n=1
-                while n>0:
+                while n>0:                           # handle balanced unescaped parentheses in string
                     p = self.nextByte()     
-                    if p==92:  # b'\\':            # '\' = 0x5c=92 escape character
-                        self.nextByte()  
-                    elif p==40:  # b'(':           # handle balanced unescaped paranthesis in string
+                    if p==92:    # b'\\':            # '\' = 0x5c=92 escape character
+                        self.nextByte()              # skip next byte, don't care if its a parenthesis cause it's escaped
+                    elif p==40:  # b'(':             
                         n += 1
                     elif p==41:  # b')':
                         n -= 1     
@@ -165,22 +280,22 @@ class PdfInterpreter():
                 self.peek += 1
                 data = bytes(self.flushStack())
             
-            elif b==60:  # b'<':
+            elif b==60:  # b'<':                     # hex string begin
                 self.popByte()
-                if self.nextByte()==60:  # b'<':         # dict_begin '<<' token
+                if self.nextByte()==60:  # b'<<':    # dict_begin '<<' token
                     token_type = 'DICT_BEGIN'
                     self.popByte()
                     # data = None
                 else:
                     token_type = 'STR_HEX'
-                    while not self.nextByte()==62:  # b'>': 
+                    while not self.nextByte()==62:    # b'>':   # hex string end
                         continue
                     self.popByte()
                     data = bytes(self.flushStack())
                         
             elif b==62:  # b'>':
                 self.popByte()
-                if self.nextByte()==62:  # b'>':
+                if self.nextByte()==62:  # b'>':      # b'>>' dict_end token  
                     token_type = 'DICT_END'
                     self.popByte()
                     # data = None
@@ -241,14 +356,16 @@ class PdfInterpreter():
             elif keyword == b'stream':
                 token_type = 'STREAM'
                 stream=True
-                self.nextByte()  # 'stream' shall be followed by newline
-                self.popByte()
+                self.nextByte()  # 'stream' shall be followed by a single CRLF or LF, not CR. "The keyword stream that follows the stream dictionary shall be followed by an end-of-line marker consisting of either a CARRIAGE RETURN and a LINE FEED or just a LINE FEED, and not by a CARRIAGE RETURN alone."
+                # print(f'{self.bytes=},{self.peek=}')
+                self.popByte(len(self.bytes))  # either 1 or 2 bytes depending if we saw \r,\r\n
+                # print(f'{self.bytes=},{self.peek=}')           
                 while stream:  
                     if self.nextByte() in self.CHAR_EOL:                   
                         while self.nextByte() in self.CHAR_EOL: continue
                         if self.bytes[-1]==101:                    # 101 = ord(b'e')
                             if bytes(self.nextBytes(8)) == b'ndstream':  
-                                self.popByte(10)  # pop '\nendstream' from stack
+                                [self.popByte() for _ in range(10)]  # pop '\nendstream' from stack
                                 data = bytes(self.flushStack())
                                 # data = (len(data),data)  # for checking consistency with /Length data preceeding string
                                 stream = False
@@ -283,7 +400,7 @@ class PdfInterpreter():
         # return Token(token_type,data,pos)                       # returns token, does NOT save to list
     
     # @profile    
-    def nextByte(self):       # peek bool allows us to read the next byte without inc counters etc..         
+    def nextByte(self):               
                                 # code duplication. but, large speed increase from unrolling for loop in 
         # return getByte()
         if self.peek>0:                  # most common n=1 case and returning raw byte (int) rather than bytes object 
@@ -392,19 +509,19 @@ class PdfInterpreter():
 ##############################################################
 
 
-# file = 'ISO_32000-2-2020_sponsored.pdf'
-file = 'engine_pyCopy.pdf'
+file = 'ISO_32000-2-2020_sponsored.pdf'
+# file = 'engine_pyCopy.pdf'
 
 
 interp = PdfInterpreter(file)
 
-i=0
-start=time.time()
-while interp.nextObject():
-    i+=1
-    pass
-end=time.time()
-print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
+# i=0
+# start=time.time()
+# while interp.nextObject():
+#     i+=1
+#     pass
+# end=time.time()
+# print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
 
 
 # start=time.time()

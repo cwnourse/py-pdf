@@ -62,8 +62,8 @@ class ByteReader():
             b = self.chunk[self.pos-self.chunkBegin]
             self.pos += 1
             return b
-        except(IndexError):  # if bounds of chunk are exceeded or chunk is not loaded
-            self.__loadChunk()  # will raise StopIteration if no more chunks to load
+        except(IndexError):    # if bounds of chunk are exceeded or chunk is not loaded
+            self.__loadChunk() # will raise StopIteration if no more chunks to load
             return next(self)  
     def __loadChunk(self):
         self.chunk = self.f.read(self.chunkSize)      
@@ -109,13 +109,13 @@ class ByteReader():
 
 class PdfInterpreter():
     # char classes.
-    CHAR_WS = [0,9,10,12,13,32]                          # + [b'\x00',b'\t',b'\n',b'\x0c',b'\r',b' ']                     
-    CHAR_EOL = [10,13]                                   # + [b'\n',b'\r']
-    CHAR_DELIM = [40,41,60,62,91,93,123,125,47,37]       # + [b'(',b')',b'<',b'>',b'[',b']',b'{',b'}',b'/',b'%']                           
-    CHAR_INT = [48,49,50,51,52,53,54,55,56,57]           # + [b'0',b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9']
-    CHAR_NUM = CHAR_INT + [43,45,46]                     # + [b'+',b'-',b'.']  
-    CHAR_NONREG = CHAR_WS + CHAR_DELIM 
-    KEYWORDS = ['obj','endobj',b'stream',b'endstream','R','true','false','xref','f','n','trailer','startxref']
+    CHAR_WS = {0,9,10,12,13,32}                        # + [b'\x00',b'\t',b'\n',b'\x0c',b'\r',b' ']                     
+    CHAR_EOL = {10,13}                                   # + [b'\n',b'\r']
+    CHAR_DELIM = {40,41,60,62,91,93,123,125,47,37}      # + [b'(',b')',b'<',b'>',b'[',b']',b'{',b'}',b'/',b'%']                           
+    CHAR_INT = {48,49,50,51,52,53,54,55,56,57}           # + [b'0',b'1',b'2',b'3',b'4',b'5',b'6',b'7',b'8',b'9']
+    CHAR_NUM = CHAR_INT | {43,45,46}                   # + [b'+',b'-',b'.']  
+    CHAR_NONREG = CHAR_WS | CHAR_DELIM 
+    # KEYWORDS = {'obj','endobj',b'stream',b'endstream','R','true','false','xref','f','n','trailer','startxref'}
     
     def __init__(self,filename):
         self.filename = filename
@@ -130,6 +130,7 @@ class PdfInterpreter():
         self.line = 1      # current line number, delim by /n, /r, or /r/n
         self.peek = 0      # current 'look ahead' in file. nextByte returns from byte stack
         self.xrefLocation = None
+        self.xref = {}
         self.EOF = False
         
     def seek(self,offset):
@@ -175,10 +176,138 @@ class PdfInterpreter():
         return pop  # raw int value of byte
         # return self.bytes.pop()
         
+    def searchDict(self,d,paramName):
+        stack = [d]          
+            
+        while stack:
+            for items in (cur:=stack[-1]):   # items == keys if its a dict
+                try:
+                    k = items
+                    v = cur[k]
+                    
+                    if k == paramName:
+                        return v
+                    else:
+                        stack.append(v)
+                except (KeyError,TypeError,IndexError):  
+                    continue
+            else:
+                stack.pop()
+        return None
+    
+    # static testing method
+    def searchDict(d,paramName):
+        # d must be a dict
+        stack = [iter(d.items())]          
+            
+        while stack:
+            try:
+                for k,v in stack[-1]:   # typeerror if d not dict
+                    try:
+                        if k == paramName:
+                            return v
+                        else:
+                            stack.append(iter(v.items()))   # TypeError if v not iterable, AttributeError if v not dict
+                            break                   # break iteration to recurse down tree. iter will remeber where we left off
+                    except AttributeError:
+                        continue    # item not dict? next item.  
+                else:
+                    stack.pop()  # pop node from stack if key not found in items
+            except TypeError:  # last stack item not iterable
+                print('ahh')
+                stack.pop()
+            
+        return None
+                
+                
+        
+    def getObjParam(self,obj_id,paramName):
+        # looks up object's param values regardless of nesting:
+            # ie. if input is b'Predictor', func will return value 12 for either {b'Predictor':12,....} or {b'DecodeParams':{b'Predictor':12,...}}, .... nested to any depth
+        # obj_id of form (objnum,gennum), paramName as bytes eg. b'Filter'
+        obj = self.getObject(obj_id)
+        params = obj[0]
+        
+        
+    
+        
+    ################################################
+    # data structure builders
+    ################################################
+    def updateXref(self,xref):
+        # xref should have unique objects, might both have trailer and xref_loc entries
+        if 'trailer' in xref:
+            if 'trailer' in self.xref:
+                self.xref['trailer'] |= xref['trailer']
+            else:
+                self.xref['trailer'] = xref['trailer']
+                
+        if 'xref_loc' in xref:
+            if 'xref_loc' in self.xref:
+                self.xref['xref_loc'].append(xref['xref_loc'])
+            else:
+                self.xref['xref_loc'] = xref['xref_loc']
+                
+        self.xref |= {k:v for k,v in xref.items() if k not in ['trailer','ref_loc']}
+        
+        return self.xref
+        
+    def buildXref(self,xref_loc=None):
+        if xref_loc is None:  # main xref table at end
+            # get xref location
+            xref_loc = self.getXrefLocation()
+        # seek to location
+        self.seek(xref_loc)
+        xref = self.nextObject()
+        if xref == 'xref':         # xref table is already parsed
+            return self.xref
+        elif len(xref)==2:         # xref is an object
+            xref_obj = self.objects[xref]
+            
+            
+        # get next object
+            # OK modify to handle standard xref tables
+        # parse object
+            # if object:
+                # decode according to filter
+                # build dictionary {obj: offset,...} from index, stream, and W
+                # follow /Prev, /Root, /Info and build these structures
+        pass
+        
     ################################################
     # data processing methods
     ###############################################
-    def deflate(self,data):
+    def decompress(self,obj):
+        if len(obj)<2:
+            # obj has no data
+            return obj
+        
+        params = obj[0]
+        data = obj[1]
+        
+        filt = None
+        try:
+            filt = params[b'Filter']
+            if len(filt) == 1:
+                filt = [filt]
+        except KeyError:
+            # object is not compressed
+            return obj
+        for f in filt:                                 # unfilter data using algorithms in the order presented  
+            if f in ['FlateDecode','LZWDecode']:
+                try:
+                    filtparams = params['DecodeParams']
+                except KeyError:
+                    filtparams = {'Predictor': 1,        # default values (table 8, 7.4.4.3 p40)
+                                  'Colors': 1,
+                                  'BitsPerComponent':8,
+                                  'Columns': 1,
+                                  'EarlyChange': 1}
+            
+            if f == 'FlateDecode':
+                pass
+            
+    def flateDecodeData(self,data):
         return zlib.decompress(data)
     def unpredict(self,data,columns):
         out = []
@@ -388,7 +517,7 @@ class PdfInterpreter():
                 token_type = 'XREF_FREE'
                 # data = None
             elif keyword == b'trailer':
-                token_type = 'TRAILER'
+                token_type = 'TRAILER_BEGIN'
                 # data = None
             elif keyword == b'startxref':
                 token_type = 'XREF_LOC'
@@ -466,62 +595,143 @@ class PdfInterpreter():
         return key
     
     def nextObject(self,stack=[]):
-        if self.EOF:
+        # recursive function could stack overflow on eg. long strings of literals
+        # mostly tail-call optimized, but not TCO in python anyway... 
+        # consider changing to a while loop if stack overflow becomes a problem
+        
+        # if self.EOF:
+        #     return False
+        if not (token := self.nextToken()) or self.EOF:
             return False
-        token = self.nextToken()
         if token.type in ['NUM_REAL','NUM_INT','STR_LIT','STR_HEX','BOOL','NAME','STREAM','NULL']:
             stack.append(token.data)
-            return self.nextObject(stack)
+            return self.nextObject(stack)  # stack overflow possible here if >1000 literals in a row...
         elif token.type in ['DICT_BEGIN','ARR_BEGIN']:
             stack.append(self.nextObject([]))
             return self.nextObject(stack)
         elif token.type == 'OBJ_REF':
             gennum,objnum = stack.pop(),stack.pop()
-            stack.append({(objnum,gennum): 'REF'})
+            stack.append({'REF':(objnum,gennum)})
             return self.nextObject(stack)
         elif token.type == 'OBJ_BEGIN':
             gennum,objnum = stack.pop(),stack.pop()
             objdata = self.nextObject([])
-            return self.newObject(objnum,gennum,objdata)   # TOP LEVEL BASE CASE
+            return self.newObject(objnum,gennum,objdata)   # TOP LEVEL BASE CASE. RECURSION STOP
         elif token.type == 'DICT_END':
             return dict(zip(stack[::2],stack[1::2]))  # make key/value pairs of stack objects
         elif token.type in ['ARR_END','OBJ_END']:
             return stack
         elif token.type == 'COMMENT':
+            # if comment text == b'%PDFx.y', b'%%EOF', do something...
+            # for now just skip
             return self.nextObject(stack)
         elif token.type == 'XREF_BEGIN':  #'xref' keyword, start of xref table
             # build xref table here
-            return False
-        elif token.type == 'XREF_LOC':  # 'startxref' kw, next token is byte offset of xref location
-            # get next int token here
-            return False
-        elif token.type == 'TRAILER':
-            # build trailer here. its just a dictionary, so safe to call nextObj here          
+            # stack = []  # assumed true.
+            token_stack = []
+            peek = 0
+            obj_num = -1
+            while True:
+                for _ in range(3-peek):
+                    token_stack.append(self.nextToken())
+                    peek = 0
+                if token_stack[2].type == 'XREF_INUSE':
+                    token_stack.pop()              # index 2
+                    obj_gen = token_stack.pop()    # index 1
+                    obj_loc = token_stack.pop()    # index 0               
+                    stack.append([(obj_num,obj_gen.data),obj_loc.data])
+                    obj_num += 1
+                    # token_stack = []
+                elif token_stack[2].type == 'XREF_FREE':
+                    token_stack.pop()
+                    next_gen = token_stack.pop()
+                    next_objnum = token_stack.pop()
+                    stack.append([(obj_num,next_gen.data),{'FREE':next_objnum.data}])
+                    obj_num += 1
+                elif token_stack[2].type == 'NUM_INT':  # xref subsection header
+                    obj_num = token_stack[0].data
+                    # obj_cnt = token_stack[1]
+                    token_stack = [token_stack[2]]
+                    peek += 1
+                elif token_stack[0].type == 'TRAILER_BEGIN':
+                    # token_stack[0] == 'trailer_begin'
+                    # token_stack[1] == 'dict_begin'
+                    # token_stack[2] == first dict key
+                    trailer_dict = self.nextObject([token_stack[2].data])
+                    stack.append(['trailer',trailer_dict])
+                    for _ in range(2):
+                        token_stack.append(self.nextToken())
+                    xref_loc = token_stack[-1].data
+                    stack.append(['xref_loc',xref_loc])
+                    self.updateXref(dict(stack))          # self.xref = dict(stack)    # dont overwrite xref table, update it!
+                    return 'xref'
+                elif token_stack[2].type == 'TRAILER_BEGIN':
+                    # if subsection header has 0 objects. next token is 'dict_begin'
+                    self.nextToken() # skip dict_begin so recursion terminates at dict_end
+                    trailer_dict = self.nextObject()
+                    stack.append(['trailer',trailer_dict])
+                    for _ in range(2):
+                        token_stack.append(self.nextToken())
+                    xref_loc = token_stack[-1].data
+                    stack.append(['xref_loc',[xref_loc]])
+                    self.updateXref(dict(stack))
+                    return 'xref' 
+                else:
+                    print(f'unhandled xref tokens {token_stack}')
+                    return False
             return False
         else:
             print(f'unhandled token {token}')
             print(f'{stack=}')
             return False
+        
+    def getObject(obj_id):
+        # obj_id := (objnum,gennum)
+        # check in xref table:
+        try:
+            obj_loc = self.xref[obj_id]                   # KeyError?
+            if obj_loc is not None:       # loc=None if object was parsed from a object stream. it resides fully parsed in the object dictionary
+                self.seek(obj_loc)
+                this_obj_id = self.nextObject()
+                assert this_obj_id == obj_id
+                obj = self.objects(this_obj_id)
+            else:
+                obj = self.objects[obj_id]
+        except KeyError:                                # object not found in xref
+            # obj not in xref so far, search xrefstm
             
+        
+        # check if in main xref table
+            # if not, check /Prev
+                # update main xref with this data and proceed
+            # if not, check /XRefStm
+                # update main xref with this data and proceed
+            # if still not found, or free/deleted, return Null object
+        # get byte offset of object
+        # seek to position
+        # obj = self.nextObject()
+        # if object stream, parse the stream for the required object
+            # parse all objs in stream to main object table
+            pass
 
         
     
 ##############################################################
 
 
-file = 'ISO_32000-2-2020_sponsored.pdf'
-# file = 'engine_pyCopy.pdf'
+# file = 'ISO_32000-2-2020_sponsored.pdf'
+file = 'engine_pyCopy.pdf'
 
 
 interp = PdfInterpreter(file)
 
-# i=0
-# start=time.time()
-# while interp.nextObject():
-#     i+=1
-#     pass
-# end=time.time()
-# print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
+i=0
+start=time.time()
+while interp.nextObject():
+    i+=1
+    pass
+end=time.time()
+print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
 
 
 # start=time.time()

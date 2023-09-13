@@ -131,6 +131,8 @@ class PdfInterpreter():
         self.peek = 0      # current 'look ahead' in file. nextByte returns from byte stack
         self.xrefLocation = None
         self.xref = {}
+        self.trailer = {}
+        self.catalog = {}
         self.EOF = False
         
     def seek(self,offset):
@@ -150,6 +152,7 @@ class PdfInterpreter():
             xrefloc.append(b)
         # del lastByte
         self.xrefLocation = int(bytes(xrefloc[::-1]))
+        
         return self.xrefLocation
         
     #################################################
@@ -175,58 +178,45 @@ class PdfInterpreter():
         if self.peek<0: self.peek=0
         return pop  # raw int value of byte
         # return self.bytes.pop()
-        
-    def searchDict(self,d,paramName):
-        stack = [d]          
-            
+    
+    def searchDict(self,d,param):
+        # breadth-first seach of dictionary that may contain nested dicts,arrays,bytestrings,and ints.
+        # dictionary cannot contain any strings.
+        # testdict = {b'1':1, b'2':{b'21':[211,b'212',{b'2131':2131}],b'22':22}, b'3':3}  # searchDict() able to finds all dict keys incl b'2131'!
+        stack=[[d,iter(d)]]
         while stack:
-            for items in (cur:=stack[-1]):   # items == keys if its a dict
+            curd = stack[0][0]       # dict (keys), array (int,bytestring,dict,array), or bytestring (ints)
+            curiter = stack[0][1]
+            for key in curiter:
                 try:
-                    k = items
-                    v = cur[k]
-                    
-                    if k == paramName:
+                    v = curd.get(key)
+                    if key == param:
                         return v
                     else:
-                        stack.append(v)
-                except (KeyError,TypeError,IndexError):  
-                    continue
+                        try:
+                            viter = iter(v)
+                        except TypeError:  # v is int
+                            continue
+                except AttributeError:  # curd is not a dict (no .get()). could be interested if it's a list. test if iterable. not interested if string. THERE ARE NO STRINGS! ONLY BYTESTRINGS WHICH ITERATES OVER INTS< NOT ITERABLE
+                    try:
+                        v = key
+                        viter = iter(v) # works for array,dict,bytestring keys
+                    except:                    # key is int
+                        continue
+                # if we get here, we didn't find they key yet and v is an iterable. add to stack
+                stack.append([v,viter])
+    
             else:
-                stack.pop()
+                stack.pop(0)  # pop iter from front when done
         return None
     
-    # static testing method
-    def searchDict(d,paramName):
-        # d must be a dict
-        stack = [iter(d.items())]          
-            
-        while stack:
-            try:
-                for k,v in stack[-1]:   # typeerror if d not dict
-                    try:
-                        if k == paramName:
-                            return v
-                        else:
-                            stack.append(iter(v.items()))   # TypeError if v not iterable, AttributeError if v not dict
-                            break                   # break iteration to recurse down tree. iter will remeber where we left off
-                    except AttributeError:
-                        continue    # item not dict? next item.  
-                else:
-                    stack.pop()  # pop node from stack if key not found in items
-            except TypeError:  # last stack item not iterable
-                print('ahh')
-                stack.pop()
-            
-        return None
-                
-                
-        
     def getObjParam(self,obj_id,paramName):
-        # looks up object's param values regardless of nesting:
-            # ie. if input is b'Predictor', func will return value 12 for either {b'Predictor':12,....} or {b'DecodeParams':{b'Predictor':12,...}}, .... nested to any depth
-        # obj_id of form (objnum,gennum), paramName as bytes eg. b'Filter'
+        # finds the value of an object's parameter
+        # returns none if object doesn't define this parameter
+        # possibly search parent objects for this attribute??
         obj = self.getObject(obj_id)
         params = obj[0]
+        return self.searchDict(params,paramName)  # None if not found
         
         
     
@@ -235,20 +225,22 @@ class PdfInterpreter():
     # data structure builders
     ################################################
     def updateXref(self,xref):
-        # xref should have unique objects, might both have trailer and xref_loc entries
-        if 'trailer' in xref:
-            if 'trailer' in self.xref:
-                self.xref['trailer'] |= xref['trailer']
-            else:
-                self.xref['trailer'] = xref['trailer']
+        # xref of format {(obj_id):loc, ...}
+        # if 'trailer' in xref:                                   # separate xref, trailer, locs
+        #     if 'trailer' in self.xref:
+        #         self.xref['trailer'] |= xref['trailer']
+        #     else:
+        #         self.xref['trailer'] = xref['trailer']
                 
-        if 'xref_loc' in xref:
-            if 'xref_loc' in self.xref:
-                self.xref['xref_loc'].append(xref['xref_loc'])
-            else:
-                self.xref['xref_loc'] = xref['xref_loc']
+        # if 'xref_loc' in xref:
+        #     if 'xref_loc' in self.xref:
+        #         self.xref['xref_loc'].append(xref['xref_loc'])
+        #     else:
+        #         self.xref['xref_loc'] = xref['xref_loc']
                 
-        self.xref |= {k:v for k,v in xref.items() if k not in ['trailer','ref_loc']}
+        # self.xref |= {k:v for k,v in xref.items() if k not in ['trailer','ref_loc']}
+        
+        self.xref |= xref  # adds entries together, overwrites duplicates (should be none doe to gen numbers) 
         
         return self.xref
         
@@ -259,7 +251,7 @@ class PdfInterpreter():
         # seek to location
         self.seek(xref_loc)
         xref = self.nextObject()
-        if xref == 'xref':         # xref table is already parsed
+        if xref == 'xref':         # xref table is already parsed and added to self.xref dict
             return self.xref
         elif len(xref)==2:         # xref is an object
             xref_obj = self.objects[xref]
@@ -277,35 +269,6 @@ class PdfInterpreter():
     ################################################
     # data processing methods
     ###############################################
-    def decompress(self,obj):
-        if len(obj)<2:
-            # obj has no data
-            return obj
-        
-        params = obj[0]
-        data = obj[1]
-        
-        filt = None
-        try:
-            filt = params[b'Filter']
-            if len(filt) == 1:
-                filt = [filt]
-        except KeyError:
-            # object is not compressed
-            return obj
-        for f in filt:                                 # unfilter data using algorithms in the order presented  
-            if f in ['FlateDecode','LZWDecode']:
-                try:
-                    filtparams = params['DecodeParams']
-                except KeyError:
-                    filtparams = {'Predictor': 1,        # default values (table 8, 7.4.4.3 p40)
-                                  'Colors': 1,
-                                  'BitsPerComponent':8,
-                                  'Columns': 1,
-                                  'EarlyChange': 1}
-            
-            if f == 'FlateDecode':
-                pass
             
     def flateDecodeData(self,data):
         return zlib.decompress(data)
@@ -320,9 +283,9 @@ class PdfInterpreter():
                 out.append((b+up)%256)
                 j+=1
             else:
-                print(f'predition method {method} not implemented')
-                return None
+                raise NotImplementedError(f'predition method {method} not implemented')
         return out
+    
     ##############################################
     # tokenizer
     ###############################################
@@ -657,25 +620,25 @@ class PdfInterpreter():
                     # token_stack[0] == 'trailer_begin'
                     # token_stack[1] == 'dict_begin'
                     # token_stack[2] == first dict key
+                    xref = dict(stack)
                     trailer_dict = self.nextObject([token_stack[2].data])
-                    stack.append(['trailer',trailer_dict])
                     for _ in range(2):
                         token_stack.append(self.nextToken())
                     xref_loc = token_stack[-1].data
-                    stack.append(['xref_loc',xref_loc])
-                    self.updateXref(dict(stack))          # self.xref = dict(stack)    # dont overwrite xref table, update it!
-                    return 'xref'
+                    rv = (xref,trailer_dict,xref_loc)
+                    self.xref.append(rv)
+                    return (-1,0) # return 2-typle to keep types consistent. -1 flag corresponds to xref table, find it in self.xref[-1]
                 elif token_stack[2].type == 'TRAILER_BEGIN':
                     # if subsection header has 0 objects. next token is 'dict_begin'
+                    xref = dict(stack)
                     self.nextToken() # skip dict_begin so recursion terminates at dict_end
                     trailer_dict = self.nextObject()
-                    stack.append(['trailer',trailer_dict])
                     for _ in range(2):
                         token_stack.append(self.nextToken())
                     xref_loc = token_stack[-1].data
-                    stack.append(['xref_loc',[xref_loc]])
-                    self.updateXref(dict(stack))
-                    return 'xref' 
+                    rv = (xref,trailer_dict,xref_loc)
+                    self.xref.append(rv)
+                    return (-1,0) # return 2-typle to keep types consistent. -1 flag corresponds to xref table, find it in self.xref[-1]
                 else:
                     print(f'unhandled xref tokens {token_stack}')
                     return False
@@ -685,22 +648,120 @@ class PdfInterpreter():
             print(f'{stack=}')
             return False
         
-    def getObject(obj_id):
-        # obj_id := (objnum,gennum)
-        # check in xref table:
-        try:
-            obj_loc = self.xref[obj_id]                   # KeyError?
-            if obj_loc is not None:       # loc=None if object was parsed from a object stream. it resides fully parsed in the object dictionary
-                self.seek(obj_loc)
-                this_obj_id = self.nextObject()
-                assert this_obj_id == obj_id
-                obj = self.objects(this_obj_id)
-            else:
-                obj = self.objects[obj_id]
-        except KeyError:                                # object not found in xref
-            # obj not in xref so far, search xrefstm
+    def decompress(self,stream,filt,decodeparams):
+        # filt either a bytestring or array of bytestrings
+        # decode params either dict or array of dicts coresponding to filters
+        if filt == b'FlateDecode':
+            stm_dc = self.flateDecodeData(stream)           
+            ## table 8: optional parameters for LZWDecode and FlateDecode filters
+            predictor = self.searchDict(decodeparams, b'Predictor')
+            colors = self.searchDict(decodeparams, b'Colors')
+            bitspercomponent = self.searchDict(decodeparams, b'BitsPerComponent')
+            columns = self.searchDict(decodeparams, b'Columns')
+            # earlychange = self.searchDict(decodeparams, b'EarlyChange')  # LZW only           
+            if not predictor: predictor = 1
+            if not colors: colors = 1
+            if not bitspercomponent: bitspercomponent = 8
+            if not columns: columns = 8        
+            if predictor>1: stm_dc = self.unpredict(stm_dc,columns)
+            return stm_dc
+        else:
+            raise NotImplementedError(f"filter type {filt} and array of filters not implemented.")
+            
             
         
+    def parseXRefStm(self,xrefstm_id):
+        # builds xref table contained in an object stream (7.5.8)
+        # ASSUMPTIONS: object must already be parsed from nextObject()
+        xrs = self.objects[xrefstm_id]
+        params = xrs[0]  # params should contain all entries in a stream (table 5), trailer (table 15), and xretstm
+        stm = xrs[1]
+        
+        ## parse params according to spec tables:
+        # table 5 entries common to all stream dictionaries:
+        length = self.searchDict(params, b'Length')
+        filt = self.searchDict(params, b'Filter')    # !!! returns either b'filtername' or [b'filter1',b'filter2',...]. only implemented for single filter at the moment
+        decodeparams = self.searchDict(params,b'DecodeParams')
+        f = self.searchDict(params,b'F')
+        dl = self.searchDict(params, b'DL')  # decompressed length
+        assert length == len(stm)
+        if f: # if 'F' defined, stream data is contained in external file.     
+            ffilt = self.searchDict(params,b'FFilter')
+            fdecodeparams = self.searchDict(params,b'FDecodeParams')
+            pass # not implemented yet..
+        
+        # table 15: entries in the file trailer dictionary
+        size = self.searchDict(params, b'Size')
+        prev = self.searchDict(params, b'Prev')
+        root = self.searchDict(params, b'Root')
+        encrypt = self.searchDict(params, b'Encrypt')
+        info = self.searchDict(params, b'Info')
+        pdf_id = self.searchDict(params, b'ID')
+            
+        # table 17: additional entries specific to a cross-reference stream dictionary
+        obj_type = self.searchDict(params, b'Type')
+        size = self.searchDict(params, b'Size')
+        index = self.searchDict(params, b'Index')
+        prev = self.searchDict(params, b'Prev')
+        w = self.searchDict(params, b'W')
+        assert self.searchDict(params, b'Type')==b'XRef'
+        if not index: index=[0,size]
+        
+        ## Decompress stream if filter present
+        if filt:
+            stm_dc = self.decompress(stm,filt,decodeparams)
+        else:
+            stm_dc = stm
+            
+        ## parse the xref stream according to W
+        w_type = w[0]  # byte widths of xref stream fields
+        w_obj = w[1]
+        w_idx = w[2]
+        w_entry = sum(w)
+        
+        entries = [stm_dc[i:i+w_entry] for i in range(0,len(stm_dc),w_entry)]  # split stream by entry width (bytes)
+        objnums = [n for objstart,nobj in zip(index[::2],index[1::2]) for n in range(objstart,objstart+nobj)]  # index=[69,2,420,3] -> objnums=[69,70,420,421,422]
+                
+        for objnum,entry in zip(objnums,entries):  # needs to iterate through chunks of stream equal to entry width w_entry
+            etype = entry[0:w_type] if w_type!=0 else 1  # conflicting default information in table 18 (default 0) vs table 17 (default 1)
+            eobj = entry[w_type:w_type+w_obj] if w_obj!=0 else 0 if etype==1 else None  # has a default value of zero (table 18, etype=1) but I'm not buying it
+            eidx = entry[w_type+w_obj:w_type+w_obj+w_idx]
+            
+            if not eobj: raise NotImplementedError(f'xrefstm: bad field W={w}')
+            
+            if etype==0:
+                # free entry
+                pass
+            elif etype==1:
+                # in-use object, not compressed
+                pass
+            elif etype==2:
+                # compressed object
+                pass
+            else:
+                raise ValueError(f'xrefstm: bad entry type {etype}')
+            
+            
+            
+            
+        
+            
+    
+    def getObjectFromXRef(self,obj_id):
+        # obj_id := (objnum,gennum)
+        # check in xref tables:
+        for xref,trailer,loc in self.xref:
+            if not (obj_loc := xref.get(obj_id)): continue
+            self.seek(obj_loc)
+            this_obj_id = self.nextObject()
+            assert this_obj_id==obj_id
+            return this_obj_id
+        # if not found in current xref table, follow /XRefStm first, then /Prev pointers for the last xref
+        # follow /XRefStm
+        if (xrefstm_loc := self.searchDict(trailer,b'XRefStm')):
+            self.seek(xrefstm_loc)
+            xrefstm_id = self.nextObject()
+            self.parseXRefStm(xrefstm_id)
         # check if in main xref table
             # if not, check /Prev
                 # update main xref with this data and proceed
@@ -755,7 +816,7 @@ print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(en
     # OK convert <int> <int> <obj|R> to object token  (in parser)
         # handle 'endobj'
     # OK build nested arrays and dicts
-    # Build xref, trailer!
+    # OK Build xref, trailer!
 # once parsed, write back to PDF file. successful if we can open as normal!
 # gui for displaying hierarchy of doc objects
     # check boxes to include/exclude, then recompile PDF
@@ -795,9 +856,10 @@ print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(en
 # OK BACK TO IT
     # make sure it can parse PDF spec docuent (linearized) OK
     # parse token stream
-        # build object dictionary {id: {name1: {}, name2:{},...}, id2: ...}
-        # build xref table/lookup dict
-        # build bookmark list
+        # OK build object dictionary {id: {name1: {}, name2:{},...}, id2: ...}
+        # OK build xref table/lookup dict
+        # build bookmark list (catalog, pagetree)
+        # get page number. Load all objects into memory via xref and create page object containing this data
     # generate PDF binary file from object structure.
         # make sure to generate proper byte offsets
     # once it can do this, remove erwin water marks and go back to wifi script

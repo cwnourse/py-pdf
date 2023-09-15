@@ -666,12 +666,13 @@ class PdfInterpreter():
             if predictor>1: stm_dc = self.unpredict(stm_dc,columns)
             return stm_dc
         else:
-            raise NotImplementedError(f"filter type {filt} and array of filters not implemented.")
+            raise NotImplementedError(f"decompress: filter type {filt} not implemented. TODO handle array of filters")
             
             
         
     def parseXRefStm(self,xrefstm_id):
         # builds xref table contained in an object stream (7.5.8)
+        # appends to xref with updated object table and trailer
         # ASSUMPTIONS: object must already be parsed from nextObject()
         xrs = self.objects[xrefstm_id]
         params = xrs[0]  # params should contain all entries in a stream (table 5), trailer (table 15), and xretstm
@@ -683,7 +684,7 @@ class PdfInterpreter():
         filt = self.searchDict(params, b'Filter')    # !!! returns either b'filtername' or [b'filter1',b'filter2',...]. only implemented for single filter at the moment
         decodeparams = self.searchDict(params,b'DecodeParams')
         f = self.searchDict(params,b'F')
-        dl = self.searchDict(params, b'DL')  # decompressed length
+        dl = self.searchDict(params, b'DL') or self.searchDict(params,b'Length1')  # decompressed length
         assert length == len(stm)
         if f: # if 'F' defined, stream data is contained in external file.     
             ffilt = self.searchDict(params,b'FFilter')
@@ -704,30 +705,34 @@ class PdfInterpreter():
         index = self.searchDict(params, b'Index')
         prev = self.searchDict(params, b'Prev')
         w = self.searchDict(params, b'W')
-        assert self.searchDict(params, b'Type')==b'XRef'
+        assert self.searchDict(params, b'Type')==b'XRef'  # this obj needs to be xref, this entry is required by spec
         if not index: index=[0,size]
         
         ## Decompress stream if filter present
         if filt:
             stm_dc = self.decompress(stm,filt,decodeparams)
+            dl_meas = len(stm_dc)
         else:
             stm_dc = stm
-            
+            dl_meas = length
+        if dl: assert dl_meas==dl
+                    
         ## parse the xref stream according to W
         w_type = w[0]  # byte widths of xref stream fields
         w_obj = w[1]
         w_idx = w[2]
         w_entry = sum(w)
         
-        entries = [stm_dc[i:i+w_entry] for i in range(0,len(stm_dc),w_entry)]  # split stream by entry width (bytes)
+        assert (dl_meas % w_entry)==0  # ensure no entries gonna get cut off
+        
+        entries = [stm_dc[i:i+w_entry] for i in range(0,dl_meas,w_entry)]  # split stream by entry width (bytes)
         objnums = [n for objstart,nobj in zip(index[::2],index[1::2]) for n in range(objstart,objstart+nobj)]  # index=[69,2,420,3] -> objnums=[69,70,420,421,422]
                 
         for objnum,entry in zip(objnums,entries):  # needs to iterate through chunks of stream equal to entry width w_entry
             etype = entry[0:w_type] if w_type!=0 else 1  # conflicting default information in table 18 (default 0) vs table 17 (default 1)
             eobj = entry[w_type:w_type+w_obj] if w_obj!=0 else 0 if etype==1 else None  # has a default value of zero (table 18, etype=1) but I'm not buying it
-            eidx = entry[w_type+w_obj:w_type+w_obj+w_idx]
-            
-            if not eobj: raise NotImplementedError(f'xrefstm: bad field W={w}')
+            eidx = entry[w_type+w_obj:w_type+w_obj+w_idx]           
+            if not eobj: raise ValueError(f'parseXRefStm: bad field W={w}') # object field width should not be zero.
             
             if etype==0:
                 # free entry

@@ -130,7 +130,7 @@ class PdfInterpreter():
         self.line = 1      # current line number, delim by /n, /r, or /r/n
         self.peek = 0      # current 'look ahead' in file. nextByte returns from byte stack
         self.xrefLocation = None
-        self.xref = {}
+        self.xref = []
         self.trailer = {}
         self.catalog = {}
         self.EOF = False
@@ -180,6 +180,9 @@ class PdfInterpreter():
         # return self.bytes.pop()
     
     def searchDict(self,d,param):
+        # !!! modify so that param contained on top level is nearly as efficient as direct dict lookup.
+            # ... I think it already is, aside from the overhead of creating the stack and loop
+            # idea: try direct lookup first; if fail, then go right into recursion
         # breadth-first seach of dictionary that may contain nested dicts,arrays,bytestrings,and ints.
         # dictionary cannot contain any strings.
         # testdict = {b'1':1, b'2':{b'21':[211,b'212',{b'2131':2131}],b'22':22}, b'3':3}  # searchDict() able to finds all dict keys incl b'2131'!
@@ -652,23 +655,27 @@ class PdfInterpreter():
         # filt either a bytestring or array of bytestrings
         # decode params either dict or array of dicts coresponding to filters
         if filt == b'FlateDecode':
-            stm_dc = self.flateDecodeData(stream)           
+            stm_dc = self.flateDecodeData(stream)                
             ## table 8: optional parameters for LZWDecode and FlateDecode filters
-            predictor = self.searchDict(decodeparams, b'Predictor')
-            colors = self.searchDict(decodeparams, b'Colors')
-            bitspercomponent = self.searchDict(decodeparams, b'BitsPerComponent')
-            columns = self.searchDict(decodeparams, b'Columns')
-            # earlychange = self.searchDict(decodeparams, b'EarlyChange')  # LZW only           
-            if not predictor: predictor = 1
-            if not colors: colors = 1
-            if not bitspercomponent: bitspercomponent = 8
-            if not columns: columns = 8        
-            if predictor>1: stm_dc = self.unpredict(stm_dc,columns)
+            if not decodeparams:
+                predictor = 1
+                colors = 1
+                bitspercomponent = 8
+                columns = 1
+            else:
+                predictor = self.searchDict(decodeparams, b'Predictor')
+                colors = self.searchDict(decodeparams, b'Colors')
+                bitspercomponent = self.searchDict(decodeparams, b'BitsPerComponent')
+                columns = self.searchDict(decodeparams, b'Columns')
+            # earlychange = self.searchDict(decodeparams, b'EarlyChange')  # LZW only  
+            if predictor>1: stm_dc = self.unpredict(stm_dc,columns)  # !!! modify unpredict to take colors, bitspercomponent args
             return stm_dc
         else:
             raise NotImplementedError(f"decompress: filter type {filt} not implemented. TODO handle array of filters")
-            
-            
+    
+    # static method
+    def hexBytesToInt(self,hexbytes):
+        return sum([b*256**((len(hexbytes)-1)-i) for i,b in enumerate(hexbytes)])
         
     def parseXRefStm(self,xrefstm_id):
         # builds xref table contained in an object stream (7.5.8)
@@ -689,7 +696,7 @@ class PdfInterpreter():
         if f: # if 'F' defined, stream data is contained in external file.     
             ffilt = self.searchDict(params,b'FFilter')
             fdecodeparams = self.searchDict(params,b'FDecodeParams')
-            pass # not implemented yet..
+            raise NotImplementedError(f'parseXRefStm: external file streams not yet supported')
         
         # table 15: entries in the file trailer dictionary
         size = self.searchDict(params, b'Size')
@@ -705,7 +712,7 @@ class PdfInterpreter():
         index = self.searchDict(params, b'Index')
         prev = self.searchDict(params, b'Prev')
         w = self.searchDict(params, b'W')
-        assert self.searchDict(params, b'Type')==b'XRef'  # this obj needs to be xref, this entry is required by spec
+        assert obj_type==b'XRef', "parseXRefStm: XRef location does not point to a valid XRef object"  # this obj needs to be xref, this entry is required by spec
         if not index: index=[0,size]
         
         ## Decompress stream if filter present
@@ -727,24 +734,49 @@ class PdfInterpreter():
         
         entries = [stm_dc[i:i+w_entry] for i in range(0,dl_meas,w_entry)]  # split stream by entry width (bytes)
         objnums = [n for objstart,nobj in zip(index[::2],index[1::2]) for n in range(objstart,objstart+nobj)]  # index=[69,2,420,3] -> objnums=[69,70,420,421,422]
-                
+        
+        xref_update =[]        
         for objnum,entry in zip(objnums,entries):  # needs to iterate through chunks of stream equal to entry width w_entry
-            etype = entry[0:w_type] if w_type!=0 else 1  # conflicting default information in table 18 (default 0) vs table 17 (default 1)
-            eobj = entry[w_type:w_type+w_obj] if w_obj!=0 else 0 if etype==1 else None  # has a default value of zero (table 18, etype=1) but I'm not buying it
-            eidx = entry[w_type+w_obj:w_type+w_obj+w_idx]           
-            if not eobj: raise ValueError(f'parseXRefStm: bad field W={w}') # object field width should not be zero.
-            
+            etype = self.hexBytesToInt(entry[0:w_type]) if w_type!=0 else 1  # conflicting default information in table 18 (default 0) vs table 17 (default 1)
+            eobj = self.hexBytesToInt(entry[w_type:w_type+w_obj]) if w_obj!=0 else 0 if etype==1 else None  # has a default value of zero (table 18, etype=1) but I'm not buying it
+            eidx = self.hexBytesToInt(entry[w_type+w_obj:w_type+w_obj+w_idx])          
+            if not eobj: 
+                raise ValueError(f'parseXRefStm: bad field W={w}') # object field width should not be zero.          
             if etype==0:
                 # free entry
-                pass
+                next_free_object = eobj       # object number of next free object
+                gennum = eidx if eidx else 0   # generation number to be used if an object with this number is created again
+                xref_entry = [(objnum,gennum),{'FREE':next_free_object}] 
             elif etype==1:
                 # in-use object, not compressed
-                pass
+                byte_offset = eobj            # location of this object in bytes from beginning of file
+                gennum = eidx if eidx else 0  # generation number of this objct (default:0)
+                xref_entry = [(objnum,gennum),byte_offset]
             elif etype==2:
                 # compressed object
-                pass
+                container_objnum = eobj  # The object number of the object stream in which this object is stored. (The generation number of the object stream shall be implicitly 0.)
+                obj_index = eidx         # index within the compressed stream where this objct is stored               
+                xref_entry = [(objnum,0),{'COMPRESSED':(container_objnum,obj_index)}]
             else:
                 raise ValueError(f'xrefstm: bad entry type {etype}')
+            xref_update.append(xref_entry)
+        
+        xref_update = dict(xref_update)
+        trailer_update = {b'Size':size,
+                         b'Prev':prev,
+                         b'Root':root,
+                         b'Encrypt':encrypt,
+                         b'Info':info,
+                         b'ID':pdf_id}
+        loc_update = xrefstm_id
+        rv = (xref_update,trailer_update,loc_update)
+        self.xref.append(rv)
+        for k,v in trailer_update.items():
+            self.trailer[k] = v
+        return (-1,0)    
+        
+        
+            
             
             
             
@@ -785,19 +817,19 @@ class PdfInterpreter():
 ##############################################################
 
 
-# file = 'ISO_32000-2-2020_sponsored.pdf'
-file = 'engine_pyCopy.pdf'
+file = 'ISO_32000-2-2020_sponsored.pdf'
+# file = 'engine_pyCopy.pdf'
 
 
 interp = PdfInterpreter(file)
 
-i=0
-start=time.time()
-while interp.nextObject():
-    i+=1
-    pass
-end=time.time()
-print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
+# i=0
+# start=time.time()
+# while interp.nextObject():
+#     i+=1
+#     pass
+# end=time.time()
+# print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(end-start):0.2f}MB/s')
 
 
 # start=time.time()
@@ -868,5 +900,12 @@ print(f'read {i+1} objects in {end-start:0.1f}s, {(interp.pos+1)/(1024*1024)/(en
     # generate PDF binary file from object structure.
         # make sure to generate proper byte offsets
     # once it can do this, remove erwin water marks and go back to wifi script
+    
+    
+# where was I..... (today: 9/19/23)
+    # decode xref stream and add it to the xref table!
+    # then follow root to build pagetree and catalog
+    # then build openPage() function to follow tree and load all page objects into memory
+    # modify xref strategy to test for linearized pdf first
 
         

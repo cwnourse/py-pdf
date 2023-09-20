@@ -823,6 +823,15 @@ file = 'ISO_32000-2-2020_sponsored.pdf'
 
 interp = PdfInterpreter(file)
 
+# testing xref parsing
+
+xrefloc = interp.getXrefLocation()
+interp.seek(xrefloc)
+xrefobj_id = interp.nextObject()
+if xrefobj_id != (-1,0):  # found a normal object
+    interp.parseXRefStm(xrefobj_id)
+    
+
 # i=0
 # start=time.time()
 # while interp.nextObject():
@@ -908,4 +917,13 @@ interp = PdfInterpreter(file)
     # then build openPage() function to follow tree and load all page objects into memory
     # modify xref strategy to test for linearized pdf first
 
+# architechtural TODOs:
+    # clean up code / remove dead code
+    # single return types
+        # how to represent Xref in regards to returning from nextobject?
+            # objects return their ID (objnum,gennum) which can be used as an xref key
+    #
+    # modify logic under consistent philosophy:
+        # start from the back
+        
         

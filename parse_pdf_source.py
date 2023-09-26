@@ -38,6 +38,7 @@ def readBytes(file, chunk=16384):
         #     yield from fchunk
 
 class ByteReader():
+    # not broken, but lots of dead code. would be nice to overload this into taking either a file or a bytestream
     def __init__(self, filename, chunkSize=4096):
         self.filename = filename
         self.f = open(self.filename,'rb')
@@ -49,7 +50,8 @@ class ByteReader():
         self.chunkBegin = -1  # byte offset of first byte in chunk.
         self.lastChunk = False  # flag that there are no more bytes to read in file
     def __del__(self):
-        self.f.close()
+        # self.f.close()
+        pass
         
     ########################################
     # custom iterator methods
@@ -117,12 +119,17 @@ class PdfInterpreter():
     CHAR_NONREG = CHAR_WS | CHAR_DELIM 
     # KEYWORDS = {'obj','endobj',b'stream',b'endstream','R','true','false','xref','f','n','trailer','startxref'}
     
-    def __init__(self,filename):
+    def __init__(self, filename, stream:bytes=None):
         self.filename = filename
-        # self.reader = iter(readBytes(filename))       # 5.44MB/s
-        # self.reader = ByteReader(filename)            # 3.90MB/s
-        # self.reader = ByteReader(filename).readAll()  # 5.46MB/s
-        self.reader = ByteReader(filename).readChunks() # 5.05MB/s
+        if stream is None:
+            # self.reader = iter(readBytes(filename))       # 5.44MB/s
+            # self.reader = ByteReader(filename)            # 3.90MB/s
+            # self.reader = ByteReader(filename).readAll()  # 5.46MB/s
+            self.reader = ByteReader(filename).readChunks() # 5.05MB/s
+            self.stream = None
+        else:
+            self.reader = iter(stream)
+            self.stream = stream
         self.objects = {}  # object dictionary: {(objNum, genNum): [Dict,Stream], ...}
         self.tokens = []   # stack of tokens
         self.bytes = []   # stack of read bytes
@@ -138,15 +145,17 @@ class PdfInterpreter():
     def seek(self,offset):
         # updates the file reader so that next(self.reader) bgeins at specified offset
         # self.reader.seek(offset)  # if self.reader=ByteReader()
-        self.reader = ByteReader(self.filename).readChunks(pos=offset)
+        self.reader = ByteReader(self.filename).readChunks(pos=offset) if self.stream is None else iter(self.stream[offset:])
         self.pos = offset
         self.bytes=[]      # reset byte buff and peek when seeking to a random location
         self.peek=0
         
-    def getXrefLocation(self):
+    def getXRefLocation(self):
         # returns the byte offset of the main xref table for this document
             # seek to this position and get next object to get xref table.
         # file always ends with '...startxref\n{INT}\n%%EOF\n'. read backwards to get this int
+        if self.stream is not None:
+            raise NotImplementedError('getXRefLocation: reading from end of bytestream not yet supported')
         lastByte = ByteReader(self.filename).readReverse()     # generator yields bytes from end
         while (b:=next(lastByte)) not in self.CHAR_INT: continue
         xrefloc = [b]
@@ -183,12 +192,26 @@ class PdfInterpreter():
     
     def searchDict(self,d,param,default=None):
         # !!! modify so that param contained on top level is nearly as efficient as direct dict lookup.
-            # ... I think it already is, aside from the overhead of creating the stack and loop
-            # idea: try direct lookup first; if fail, then go right into recursion
+            # added first try/except to guarentee O(1) lookup if in toplevel, otherwise O(N) if allowed to proceed
         # breadth-first seach of dictionary that may contain nested dicts,arrays,bytestrings,and ints.
         # dictionary cannot contain any strings.
         # testdict = {b'1':1, b'2':{b'21':[211,b'212',{b'2131':2131}],b'22':22}, b'3':3}  # searchDict() able to finds all dict keys incl b'2131'!
-        stack=[[d,iter(d)]]
+
+        try:
+            return d[param]
+        except KeyError:  # param not in top-level dict (but d IS a dict...), proceed with recursion
+            pass
+        except TypeError:  # d is a list, int, or other non-dict
+            if not d:  # empty list or None
+                return default
+            else:            
+                pass  # could be a list... proceed with search in case one list element is a dict!
+            
+        try:   
+            stack=[[d,iter(d)]]
+        except TypeError:  # d is not iterable
+            raise TypeError(f'searchDict: {d=} is not a iterable datastructure. Must be list or dict.')
+
         while stack:
             curd = stack[0][0]       # dict (keys), array (int,bytestring,dict,array), or bytestring (ints)
             curiter = stack[0][1]
@@ -206,7 +229,7 @@ class PdfInterpreter():
                     try:
                         v = key
                         viter = iter(v) # works for array,dict,bytestring keys
-                    except:                    # key is int
+                    except TypeError:  # key is not iterable, skip
                         continue
                 # if we get here, we didn't find they key yet and v is an iterable. add to stack
                 stack.append([v,viter])
@@ -220,7 +243,8 @@ class PdfInterpreter():
         # returns none if object doesn't define this parameter
         # possibly search parent objects for this attribute??
         obj = self.getObject(obj_id)
-        params = obj[0]
+        assert obj==obj_id
+        params = self.objects[obj_id][0]
         return self.searchDict(params,paramName)  # None if not found
         
         
@@ -229,47 +253,15 @@ class PdfInterpreter():
     ################################################
     # data structure builders
     ################################################
-    def updateXref(self,xref):
-        # xref of format {(obj_id):loc, ...}
-        # if 'trailer' in xref:                                   # separate xref, trailer, locs
-        #     if 'trailer' in self.xref:
-        #         self.xref['trailer'] |= xref['trailer']
-        #     else:
-        #         self.xref['trailer'] = xref['trailer']
-                
-        # if 'xref_loc' in xref:
-        #     if 'xref_loc' in self.xref:
-        #         self.xref['xref_loc'].append(xref['xref_loc'])
-        #     else:
-        #         self.xref['xref_loc'] = xref['xref_loc']
-                
-        # self.xref |= {k:v for k,v in xref.items() if k not in ['trailer','ref_loc']}
-        
-        self.xref |= xref  # adds entries together, overwrites duplicates (should be none doe to gen numbers) 
-        
-        return self.xref
-        
-    def buildXref(self,xref_loc=None):
-        if xref_loc is None:  # main xref table at end
-            # get xref location
-            xref_loc = self.getXrefLocation()
-        # seek to location
-        self.seek(xref_loc)
-        xref = self.nextObject()
-        if xref == 'xref':         # xref table is already parsed and added to self.xref dict
-            return self.xref
-        elif len(xref)==2:         # xref is an object
-            xref_obj = self.objects[xref]
-            
-            
-        # get next object
-            # OK modify to handle standard xref tables
-        # parse object
-            # if object:
-                # decode according to filter
-                # build dictionary {obj: offset,...} from index, stream, and W
-                # follow /Prev, /Root, /Info and build these structures
-        pass
+    def updateXRef(self,xref_objid:tuple):
+        # handle addition of xref object entry to self, ensure uniqueness and preseve insertion order
+        if xref_objid not in self.xref: self.xref.append(xref_objid)      
+        return True
+    
+    def updateTrailer(self,trailer_dict:dict) -> bool:
+        self.trailer |= trailer_dict
+        return True
+   
         
     ################################################
     # data processing methods
@@ -297,7 +289,8 @@ class PdfInterpreter():
     def tokenize(self):
         if not self.EOF:
             while self.nextToken(): continue
-        return None
+            return True
+        return False
         
     def newToken(self,token_type,data,position) -> Token:
         t = Token(token_type,data,position)
@@ -652,28 +645,23 @@ class PdfInterpreter():
             return False
         
     def addXRef(self, xref_dict:dict, trailer_dict:dict, xref_loc:int, obj_id:tuple[int]=None) -> tuple[int]:
+        # adds xref data to PDF object. appends xref object list, updates file trailer
         if obj_id == None:
             obj_id = ('XREF', xref_loc)
-        self.xref.append(obj_id)
-        self.trailer |= trailer_dict
-        return self.newObject(obj_id[0],obj_id[1],[trailer_dict,xref_dict])
+        self.updateXRef(obj_id)
+        self.updateTrailer(trailer_dict)
+        return self.newObject(*obj_id,[trailer_dict,xref_dict])
         
-    def decompress(self,stream,filt,decodeparams):
+    def decompress(self,stream:bytes,filt:bytes,decodeparams:dict=None) -> bytes:
         # filt either a bytestring or array of bytestrings
         # decode params either dict or array of dicts coresponding to filters
         if filt == b'FlateDecode':
             stm_dc = self.flateDecodeData(stream)                
             ## table 8: optional parameters for LZWDecode and FlateDecode filters
-            if not decodeparams:
-                predictor = 1
-                colors = 1
-                bitspercomponent = 8
-                columns = 1
-            else:
-                predictor = self.searchDict(decodeparams, b'Predictor',1)
-                colors = self.searchDict(decodeparams, b'Colors',1)
-                bitspercomponent = self.searchDict(decodeparams, b'BitsPerComponent',8)
-                columns = self.searchDict(decodeparams, b'Columns',1)
+            predictor = self.searchDict(decodeparams, b'Predictor',1)
+            colors = self.searchDict(decodeparams, b'Colors',1)
+            bitspercomponent = self.searchDict(decodeparams, b'BitsPerComponent',8)
+            columns = self.searchDict(decodeparams, b'Columns',1)
             # earlychange = self.searchDict(decodeparams, b'EarlyChange')  # LZW only  
             if colors!=1 or bitspercomponent != 8:
                 raise NotImplementedError(f"decompress: DecodeParms {colors=}, {bitspercomponent=} not implemented. TODO handle all decodeparms")
@@ -698,21 +686,14 @@ class PdfInterpreter():
         # table 5 entries common to all stream dictionaries:
         length = self.searchDict(params, b'Length')
         filt = self.searchDict(params, b'Filter')    # !!! returns either b'filtername' or [b'filter1',b'filter2',...]. only implemented for single filter at the moment
-        decodeparms = self.searchDict(params,b'DecodeParms')
-        # if filt and not decodeparms:
-                ## since maybe columns, other decode params etc might not be in a dict...
-        #     # table 8: optional parameters for flatedecode and lzwencode
-        #     predictor = self.searchDict(params, b'Predictor')
-        #     columns = self.searchDict(params,b'Columns')
-            
-            
+        decodeparms = self.searchDict(params,b'DecodeParms')                      
         f = self.searchDict(params,b'F')
         dl = self.searchDict(params, b'DL') or self.searchDict(params,b'Length1')  # decompressed length
         assert length == len(stm)
         if f: # if 'F' defined, stream data is contained in external file.     
             ffilt = self.searchDict(params,b'FFilter')
             fdecodeparms = self.searchDict(params,b'FDecodeParms')
-            raise NotImplementedError(f'parseXRefStm: external file streams not yet supported')
+            raise NotImplementedError(f'parseXRefStm: external file streams not yet supported ({xrefstm_id=},{f=})')
         
         # table 15: entries in the file trailer dictionary
         size = self.searchDict(params, b'Size')
@@ -790,11 +771,88 @@ class PdfInterpreter():
                          b'ID':pdf_id}
         loc_update = xrefstm_id
         return self.addXRef(xref_update,trailer_update,loc_update)
-        # rv = (xref_update,trailer_update,loc_update)
-        # self.xref.append(rv)
-        # for k,v in trailer_update.items():
-        #     self.trailer[k] = v
-        # return (-1,0)    
+        
+    
+        
+    def parseObjStream(self, objstm_id:tuple[int], obj_id:tuple[int] = None) -> list[tuple[int]]:
+        # if obj_id is None, parse all objects from this stream and add to object table
+        # if a specific obj id is specified, 
+            # decompress stream if needed
+                # save decompressed stream to object to avoid duplicating decompression effort
+            # random access stream to parse only this object and add to obj table
+        
+        objstm_id2 = self.getObject(objstm_id)
+        assert objstm_id2 == objstm_id
+        objstm = self.objects[objstm_id]
+        params = objstm[0]
+        stm = objstm[1]
+        
+        # check for additional custom params (if we've already parsed this object)
+        xref = self.searchDict(params,b'XRef')
+        
+        # if no xref table, we haven't parsed it yet. decompess this object and extract its reference table
+        if xref is None:        
+            ## parse params according to spec tables:
+            # table 5 entries common to all stream dictionaries:
+            length = self.searchDict(params, b'Length')
+            filt = self.searchDict(params, b'Filter')    # !!! returns either b'filtername' or [b'filter1',b'filter2',...]. only implemented for single filter at the moment
+            decodeparms = self.searchDict(params,b'DecodeParms')                      
+            f = self.searchDict(params,b'F')
+            dl = self.searchDict(params, b'DL') or self.searchDict(params,b'Length1')  # decompressed length
+            assert length == len(stm)
+            if f:  # if 'F' defined, stream data is contained in external file.     
+                ffilt = self.searchDict(params,b'FFilter')
+                fdecodeparms = self.searchDict(params,b'FDecodeParms')
+                raise NotImplementedError(f'parseXRefStm: external file streams not yet supported ({objstm_id=},{f=})')
+            
+            # table 16: additional entries specific to an object stream dictionary
+            obj_type = self.searchDict(params,b'Type')
+            assert obj_type==b'ObjStm'
+            n = self.searchDict(params,b'N')
+            first = self.searchDict(params,b'First')
+            extends = self.searchDict(params,b'Extends')
+            
+            # decompress stream according to filter
+            stm_dc = self.decompress(stm, filt, decodeparms) if filt else stm
+            stm_dc_len = len(stm_dc)
+            if dl: assert stm_dc_len==dl
+                
+            streamInterpreter = PdfInterpreter(None,stream=stm_dc)
+            while streamInterpreter.nextToken().type == 'NUM_INT': continue  # stack will be full of N int pairs, last token is DICT_BEGIN
+            tokens = streamInterpreter.tokens
+            assert tokens.pop().type in {'DICT_BEGIN','ARR_BEGIN'}
+            assert len(tokens) == 2*n
+            xref = dict(zip([(objid.data,0) for objid in tokens[::2]],[t.data for t in tokens[1::2]]))
+            # print(f'{first=},{streamInterpreter.pos=} \n {streamInterpreter.bytes=} \n {streamInterpreter.peek=} \n {streamInterpreter.tokens=}')
+            
+            # overwrite this object with the decompressed version, and add custom params to save the old params and mark this one as already processed
+            self.objects[objstm_id][0] = params = {b'OGObjectParms': params,
+                                                   b'Length': stm_dc_len-first,
+                                                   b'XRef': xref,
+                                                   b'Type': obj_type,
+                                                   b'N': n
+                                                   }
+            self.objects[objstm_id][1] = stm = stm_dc[first:]
+        
+        
+        if obj_id is None:
+            # parse all objects and add to table
+            foundObjs = []
+            streamInterpreter = PdfInterpreter(None,stm)
+            for obj_id,offset in xref.items():
+                streamInterpreter.seek(offset)
+                assert streamInterpreter.nextToken().type in {'DICT_BEGIN','ARR_BEGIN'}
+                obj_params = streamInterpreter.nextObject()  # dict of params:values
+                foundObjs.append(self.newObject(*obj_id, [obj_params]))
+            return foundObjs
+        else:
+            streamInterpreter = PdfInterpreter(None,stm)
+            offset = xref[obj_id]
+            streamInterpreter.seek(offset)
+            assert streamInterpreter.nextToken().type in {'DICT_BEGIN','ARR_BEGIN'}
+            obj_params = streamInterpreter.nextObject()  # dict of params:values
+            return [self.newObject(*obj_id,[obj_params])]
+
         
         
     def getObject(self,obj_id: tuple[int]) -> tuple[int]:
@@ -803,31 +861,31 @@ class PdfInterpreter():
         if obj_id in self.objects:
             return obj_id
         else:
-            obj_loc = self.xrefLookup(obj_id)
-            # !!! if object is compressed in a ref stream, the stream will need to be processed first
-                # in this case, obj_loc = {'COMPRESSED': (container_obj_id, index_in_container_stream)}
-            # if obj
+            obj_loc = self.xrefLookup(obj_id)  # !!! how can xrefLookup return a consistent type for normal and compressed objects? idea: {'type':'normal'|'compressed'|'ref', 'loc':loc[int], 'obj_id':obj_id}. obj_id is either this object(normal/ref) or container object (compressed), loc refers to offset of obj_id
+            
+            # test for compressed object
             if obj_loc:
-                print(f"{obj_loc=}")
-                self.seek(obj_loc)
-                found_obj_id = self.nextObject()
-                assert found_obj_id==obj_id
-                return found_obj_id
+                try:
+                    objstm_id = obj_loc['COMPRESSED']  # (obj_id, index_within_stream). ignore index within stream, assume gen number is 0 per spec
+                    return self.parseObjStream((objstm_id[0],0),obj_id)[0]
+                except KeyError:
+                    raise ValueError(f'getObject: invalid xref object location {obj_id=},{obj_loc=}')
+                except TypeError:  # obj_loc is an int (direct byte offset of uncompressed object)
+                    # print(f"{obj_loc=}")
+                    self.seek(obj_loc)
+                    found_obj_id = self.nextObject()
+                    assert found_obj_id==obj_id
+                    return found_obj_id
             else:
-                raise ValueError(f'getObject: {obj_id=} not found in XRef')
+                raise ValueError(f'getObject: {obj_id=} not found in XRef. ({obj_loc=}')
        
             
     def xrefLookup(self,obj_id: tuple[int]) -> int:
         # returns the byte offset of a given object by searching through xref entries
-        # assumes Main xref is already parsed
-        # xref represented as object with id ('XREF',0)
+        # xref represented as object with id ('XREF',objid)
         
-        
-        
-        # search main xref for object location
-            # if not in main xref
-                # try xrefstm if present
-                # try prev if present
+        if not self.xref:  # no xrefs parsed yet
+            self.getMainXRef()        
         
         xref_id = None
         for xref_id in self.xref:
@@ -844,7 +902,7 @@ class PdfInterpreter():
             xrefext_loc = self.searchDict(lasttrailer, b'XRefStm') or self.searchDict(lasttrailer, b'Prev')  # search xrefstm first if present (7.5.8.4, p69)
             if not xrefext_loc:
                 return None  # no more xref extensions and object not found :(  
-            old_xrefs = self.xref.copy()      # must copy xref table, since nextObject will modify it            
+            old_xrefs = self.xref.copy()      # must copy xref table, since nextObject could modify it            
             self.seek(xrefext_loc)
             xref_id = interp.nextObject()
             if xref_id in old_xrefs:  
@@ -860,39 +918,32 @@ class PdfInterpreter():
                
         return None
                
-            
+    def getMainXRef(self) -> tuple:
+        # parses the main xref stream referenced at end of document.
+        # populates self.trailer as well
+        loc = self.getXRefLocation()
+        self.seek(loc)
+        xref_obj = self.nextObject()
+        if self.getObjParam(xref_obj,b'Type')==b'XRef':
+            return self.parseXRefStm(xref_obj)
+        else:
+            return xref_obj
         
-            
+    def getRoot(self):
+        # parses the root dictionary from file trailer into self.root
+        # returns root dictionary
+        # check if have trailer. if not, parse main xref
+        if not self.trailer:
+            self.getMainXRef()
+        self.root_id = self.searchDict(self.trailer, b'Root')['REF']  # shall be an indirect reference
+        self.root = self.objects[self.getObject(self.root_id)]
+        return self.root
     
-    def getObjectFromXRef(self,obj_id):
-        # obj_id := (objnum,gennum)
-        # check in xref tables:
-        for xref,trailer,loc in self.xref:
-            if not (obj_loc := xref.get(obj_id)): continue
-            self.seek(obj_loc)
-            this_obj_id = self.nextObject()
-            assert this_obj_id==obj_id
-            return this_obj_id
-        # if not found in current xref table, follow /XRefStm first, then /Prev pointers for the last xref
-        # follow /XRefStm
-        if (xrefstm_loc := self.searchDict(trailer,b'XRefStm')):
-            self.seek(xrefstm_loc)
-            xrefstm_id = self.nextObject()
-            self.parseXRefStm(xrefstm_id)
-        # check if in main xref table
-            # if not, check /Prev
-                # update main xref with this data and proceed
-            # if not, check /XRefStm
-                # update main xref with this data and proceed
-            # if still not found, or free/deleted, return Null object
-        # get byte offset of object
-        # seek to position
-        # obj = self.nextObject()
-        # if object stream, parse the stream for the required object
-            # parse all objs in stream to main object table
-            pass
-
-        
+    def parseOutlineTree(self):
+        # parses the outline tree specified in root dictionary into self.outlines
+        self.outline_root_id = self.searchDict(self.root,b'Outlines')['REF']  # shall be an indirect reference
+        pass
+            
     
 ##############################################################
 
@@ -901,19 +952,37 @@ file = 'ISO_32000-2-2020_sponsored.pdf'
 # file = 'engine_pyCopy.pdf'
 
 
-interp = PdfInterpreter(file)
+interp = PdfInterpreter(file)  # 60us object creation (timeit)
 
-# testing xref parsing
+# testing object access/tree parsing
+mainxref = interp.getMainXRef()  # timeit: 18ms on pdf spec document
+rootobj_id = interp.searchDict(interp.trailer, b'Root')
+interp.root = interp.getObject(rootobj_id['REF'])
 
-xrefloc = interp.getXrefLocation()
-print(f"{xrefloc=}")
-interp.seek(xrefloc)
-xrefobj_id = interp.nextObject()
-print(f"{xrefobj_id=}")
-if xrefobj_id[0] != b'XREF':  # found a normal object, parse as xref stream
-    interp.parseXRefStm(xrefobj_id)
-rootobjid = interp.trailer[b'Root']['REF']
-print(interp.getObject(rootobjid))
+# parse outline first to test automated object parsing and see if it matches up with acrobat
+interp.outlineroot = interp.getObjParam(interp.root, b'Outlines')['REF']
+
+interp.parseOutlineTree()
+
+
+
+
+# testing xref parsing (9/24)
+
+# xrefloc = interp.getXrefLocation()
+# print(f"{xrefloc=}")
+# interp.seek(xrefloc)
+# xrefobj_id = interp.nextObject()
+# print(f"{xrefobj_id=}")
+# if xrefobj_id[0] != b'XREF':  # found a normal object, parse as xref stream
+#     interp.parseXRefStm(xrefobj_id)
+# rootobjid = interp.trailer[b'Root']['REF']
+# interp.root = interp.getObject(rootobjid)
+# print(interp.root)
+# outline = interp.getObjParam(interp.root, b'Outlines')
+# outlineroot = interp.getObject(outline['REF'])  # !!! change object reresentation so we don't have to call the reference value. consistent type between direct, indirect, and compressed objects for lookup
+# print(f'{outlineroot=}')
+
 # try:
 #     rootobjloc = interp.xref[-1][0][rootobjid]
 # except KeyError:
@@ -1060,4 +1129,10 @@ print(interp.getObject(rootobjid))
         # if xrefstm, store as ('XRefStm',0)...
         
             
+        
+# Today 9/26: 
+    # getObject works for compressed objects now.
+    # parse outline tree
+    # parse page tree
+    
         
